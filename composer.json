@@ -19,9 +19,7 @@
     "symfony/stopwatch": "^4.3"
   },
   "autoload": {
-    "psr-0": {
-      "Dwo\\ProcessProcessor": "/"
-    }
+    "psr-4": { "Dwo\\ProcessProcessor\\": "" }
   },
   "extra": {
     "branch-alias": {
