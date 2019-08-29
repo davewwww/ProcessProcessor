@@ -7,20 +7,80 @@ use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Process\Exception\ProcessTimedOutException;
 use Symfony\Component\Process\Process;
 use Symfony\Component\Stopwatch\Stopwatch;
+use Symfony\Component\Stopwatch\StopwatchEvent;
 
 class QueuedProcessor
 {
-    /** @var OutputInterface */
+    /** @var int */
+    private $parallel;
+
+    /** @var OutputInterface|null */
     private $output;
+
+    /** @var Process[] */
+    private $processes = [];
+
+    /** @var Process[] */
+    private $processesAll = [];
+
+    /** @var callable|null */
+    private $onTerminated;
+
+    /** @var Stopwatch|null */
+    private $watch;
+
+    /** @var int|null */
+    private $lastTick = null;
 
     /**
      * QueuedProcessor constructor.
      *
      * @param OutputInterface $output
      */
-    public function __construct(OutputInterface $output = null)
+    public function __construct(OutputInterface $output = null, int $parallel = 10)
     {
+        $this->parallel = $parallel;
         $this->output = $output ?? new NullOutput();
+    }
+
+    /**
+     * @param callable|null $onTerminated
+     */
+    public function setOnTerminated(?callable $onTerminated): void
+    {
+        $this->onTerminated = $onTerminated;
+    }
+
+    public function hasProcesses()
+    {
+        return count($this->processes);
+    }
+
+    public function addProcess($key, Process $process)
+    {
+        $this->processes[$key] = $process;
+        $this->processesAll[$key] = $process;
+    }
+
+    public function addProcessAndStart($key, Process $process)
+    {
+        $this->addProcess($key, $process);
+
+        if ($this->startable($this->processes, $this->parallel)) {
+            $this->startProcesses([$key => $process]);
+        }
+    }
+
+    public function addProcesses($processes)
+    {
+        foreach ($processes as $key => $process) {
+            $this->addProcess($key, $process);
+        }
+    }
+
+    public function setParallel(int $parallel)
+    {
+        $this->parallel = $parallel;
     }
 
     /**
@@ -28,114 +88,135 @@ class QueuedProcessor
      * @param int                                 $parallel
      * @param callable|null                       $onTerminated
      */
-    public function wait($processes, int $parallel = 10, callable $onTerminated = null): void
+    public function wait($processes = [], int $parallel = null, callable $onTerminated = null): void
     {
-        $watch = new Stopwatch();
-        $watch->start('all');
+        if(null !== $this->parallel) {
+            $this->parallel = $parallel;
+        }
+        if(null !== $this->onTerminated) {
+            $this->onTerminated = $onTerminated;
+        }
 
-        $countAll = count($processes = $this->prepareProcesses($processes));
+        $this->addProcesses($this->prepareProcesses($processes));
 
         do {
-            foreach ($startable = $this->findStartableProcesses($processes, $parallel) as $key => $process) {
-
-                //commandline output
-                $this->output->writeln('', OutputInterface::VERBOSITY_VERBOSE);
-                $this->output->writeln(sprintf('started %s', $process->getCommandLine()), OutputInterface::VERBOSITY_VERBOSE);
-
-                $process->start(
-                    function ($type, $data) use ($key) {
-                        foreach(explode(PHP_EOL,trim($data)) as $fe) {
-                            $line = sprintf('%s [%s] %s', strtoupper($type), $key, trim($fe));
-                            if ('err' === $type) {
-                                $line = sprintf('<error>%s</error>', $line);
-                            } else {
-                                $line = sprintf('<info>%s</info>', $line);
-                            }
-                            $this->output->writeln($line);
-                        }
-                        $this->output->writeln('');
-                    }
-                );
-                $process->setTimeout(120);
-                $process->setIdleTimeout(60);
+            $startable = $this->findStartableProcesses();
+            if (!empty($startable)) {
+                $this->startProcesses($startable);
             }
 
-            if ($startable) {
-                $this->output->writeln('');
-                $this->output->writeln(
-                    sprintf(
-                        'STARTED ... %s sek | %s processes [%s]',
+            $this->tick();
 
-                        date('i:s', $watch->getEvent('all')->getDuration() / 1000),
-                        count($startable),
-                        implode('], [', array_keys($startable))
-                    )
-                );
-            }
-
-            foreach ($processes as $key => $process) {
-                if ($process->isTerminated()) {
-                    unset($processes[$key]);
-
-                    if (null !== $onTerminated) {
-                        $onTerminated($key, $process);
-                    }
-                }
-            }
-
-            $countLeft = count($processes);
-
-            $this->output->writeln(
-                sprintf(
-                    '%s ... %s sek | %s/%s done',
-                    $countLeft ? 'WAITING' : ' =DONE=',
-                    date('i:s', $watch->getEvent('all')->getDuration() / 1000),
-                    $countAll - $countLeft,
-                    $countAll
-                )
-            );
-
-            if ($countLeft) {
+            if ($countLeft = count($this->processes)) {
                 sleep(1);
             }
         } while ($countLeft);
     }
 
-    /**
-     * @param Process[] $processes
-     * @param int       $parallel
-     *
-     * @return Process[]
-     */
-    protected function findStartableProcesses(array $processes, int $parallel): array
+    public function tick(): void
     {
-        $startable = $this->startable($processes, $parallel);
+        //only one tick per sec
+        if (null !== $this->lastTick) {
+            if (time() === $this->lastTick) {
+                return;
+            }
+        }
 
-        $started = [];
-        foreach ($processes as $key => $process) {
-            if (!$process->isStarted()) {
-                $started[$key] = $process;
+        //check terminated processes, unset process and call onTerminated
+        foreach ($this->processes as $key => $process) {
+            if ($process->isTerminated()) {
+                unset($this->processes[$key]);
 
-                if (0 === --$startable) {
-                    break;
+                if (null !== $this->onTerminated) {
+                    $onTerminated = $this->onTerminated;
+                    $onTerminated($key, $process);
                 }
             }
         }
 
-        return $started;
+        $countAll = count($this->processesAll);
+        $countLeft = count($this->processes);
+
+        $this->output->writeln(
+            sprintf(
+                '%s ... %s sek | %s/%s done',
+                $countLeft ? 'WAITING' : ' =DONE=',
+                date('i:s', $this->getWatch()->getDuration() / 1000),
+                $countAll - $countLeft,
+                $countAll
+            )
+        );
+
+        $this->lastTick = time();
     }
 
+    protected function startProcesses(array $processes)
+    {
+        foreach ($processes as $key => $process) {
+            $this->output->writeln('', OutputInterface::VERBOSITY_VERBOSE);
+            $this->output->writeln(sprintf('started %s', $process->getCommandLine()), OutputInterface::VERBOSITY_VERBOSE);
+
+            $process->start(
+                function ($type, $data) use ($key) {
+                    foreach (explode(PHP_EOL, trim($data)) as $fe) {
+                        $line = sprintf('%s [%s] %s', strtoupper($type), $key, trim($fe));
+                        if ('err' === $type) {
+                            $line = sprintf('<error>%s</error>', $line);
+                        } else {
+                            $line = sprintf('<info>%s</info>', $line);
+                        }
+                        $this->output->writeln($line);
+                    }
+                    $this->output->writeln('');
+                }
+            );
+
+            $process->setTimeout(120);
+            $process->setIdleTimeout(60);
+        }
+
+        if($count = count($processes)) {
+            $this->output->writeln('');
+            $this->output->writeln(
+                sprintf(
+                    'STARTED ... %s sek | %s processes [%s]',
+                    date('i:s', $this->getWatch()->getDuration() / 1000),
+                    $count,
+                    implode('], [', array_keys($processes))
+                )
+            );
+        }
+    }
 
     /**
-     * @param Process[] $processes
-     * @param int       $parallel
-     *
+     * @return Process[]
+     */
+    protected function findStartableProcesses(): array
+    {
+        $processes = [];
+
+        if ($startable = $this->startable()) {
+            foreach ($this->processes as $key => $process) {
+                if (!$process->isStarted()) {
+                    $processes[$key] = $process;
+
+                    if (0 >= --$startable) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        return $processes;
+    }
+
+    /**
      * @return int
      */
-    protected function startable(array $processes, int $parallel): int
+    protected function startable(): int
     {
         $running = $terminated = 0;
-        foreach ($processes as $key => $process) {
+        foreach ($this->processes as $key => $process) {
             if ($process->isRunning()) {
                 ++$running;
             }
@@ -150,7 +231,10 @@ class QueuedProcessor
             }
         }
 
-        $open = count($processes) - $running - $terminated;
+        $open = count($this->processes) - $running - $terminated;
+
+        //no negative value
+        $parallel = max(0, $this->parallel);
 
         return 0 === $parallel ? $open : min($parallel - $running, $open);
     }
@@ -176,4 +260,15 @@ class QueuedProcessor
 
         return $processes;
     }
+
+    protected function getWatch(): StopwatchEvent
+    {
+        if (null === $this->watch) {
+            $this->watch = new Stopwatch();
+            $this->watch->start(self::class);
+        }
+
+        return $this->watch->getEvent(self::class);
+    }
+
 }
