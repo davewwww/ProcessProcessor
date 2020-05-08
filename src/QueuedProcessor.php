@@ -67,7 +67,7 @@ class QueuedProcessor
 
             $this->tick(0);
 
-            if ($countOpen = count($this->collector->getOpenProcesses())) {
+            if ($countOpen = count($this->collector->getOpenProcesses() + $this->collector->getRunningProcesses())) {
                 sleep(1);
             }
         } while ($countOpen);
@@ -150,7 +150,7 @@ class QueuedProcessor
         $this->output->writeln(
             sprintf(
                 '%s ... %s sek | %s/%s done',
-                $countLeft ? 'WAITING' : ' =DONE=',
+                $countLeft + $countRunning ? 'WAITING' : ' =DONE=',
                 date('i:s', $this->getStopwatchEvent()->getDuration() / 1000),
                 $countAll - $countLeft,
                 $countAll
